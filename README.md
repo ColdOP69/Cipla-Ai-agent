@@ -6,7 +6,8 @@ A self-contained, browser-only tool for spotting trends and building quick forec
 
 ## What it does
 
-- **Upload a CSV or Excel file** (`.csv`, `.xlsx`, `.xlsm` — drag-and-drop or file picker) — nothing leaves the browser, there's no backend. Multi-sheet workbooks get a sheet picker, pre-selecting the largest sheet.
+- **Upload a CSV or Excel file** (`.csv`, `.xlsx`, `.xlsm` — drag-and-drop or file picker) — nothing leaves the browser, there's no backend. Multi-sheet workbooks are understood as a whole, not just one sheet at a time (see below).
+- **Every sheet stays available** — sheets that share identical columns (e.g. Cardiac / Diabetes / Oncology tabs with the same MAT/Sales layout) are automatically combined into one dataset with an added "Sheet" column, so you can immediately trend or compare across categories. Sheets with a different shape (like a glossary tab) are kept separate. A switcher next to the file name lets you jump to any individual sheet or the combined view any time, with no re-upload.
 - **Auto-detects trend metrics** by recognizing repeating column headers like `MAT FEB'24` / `MAT FEB'25` / `MAT FEB'26` or `Sales Jan` / `Sales Feb`, and groups them into timelines automatically.
 - **Dashboard overview** — sparkline KPI cards per detected metric (with a linear-trend forecast) and a composition donut that auto-picks a sensible category to break any metric down by.
 - **Trend charts** — pick a metric and an optional "group by" dimension (company, brand, segment, etc.); toggle between line and bar, click a legend item to isolate a series, hover any point for the exact value, and see a full breakdown table.

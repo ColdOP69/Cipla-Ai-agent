@@ -241,13 +241,12 @@
   .hbar-fill{position:absolute;top:0;bottom:0;border-radius:5px;transition:width .6s cubic-bezier(.2,.8,.2,1);}
   .hbar-value{font-family:var(--font-mono);color:var(--text-muted);text-align:right;font-variant-numeric:tabular-nums;}
 
-  /* Sheet picker */
-  .sheet-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;}
-  .sheet-row:last-child{border-bottom:none;}
-  .sheet-row:hover{background:var(--surface-2);}
-  .sheet-row input{margin:0;flex:none;}
-  .sheet-row .sname{font-weight:600;flex:1;}
-  .sheet-row .sdims{font-size:12.5px;color:var(--text-muted);font-family:var(--font-mono);}
+  /* Sheet switcher */
+  .sheet-switcher{
+    font:inherit;font-size:13px;background:var(--surface);border:1px solid var(--border);color:var(--accent-strong);
+    border-radius:100px;padding:5px 12px;cursor:pointer;max-width:320px;box-shadow:var(--shadow);font-weight:600;
+  }
+  .sheet-switcher:hover{border-color:var(--accent);}
 </style>
 
 <div class="wrap">
@@ -264,25 +263,19 @@
     </div>
     <div class="file-status" id="fileStatus" hidden>
       <span class="chip num" id="fileStatusChip">—</span>
+      <select id="sheetSwitcher" class="sheet-switcher" hidden></select>
       <button class="ghost" id="resetBtn">Load different file</button>
     </div>
   </header>
 
   <div id="dropzone">
     <h2>Drop a CSV or Excel file here</h2>
-    <p>Works with any spreadsheet export — sales, market share, inventory, whatever you track over time. It looks for repeating columns like <span class="num">"MAT FEB'24" / "MAT FEB'25"</span> or <span class="num">"Sales Jan" / "Sales Feb"</span> and turns them into trend lines and forecasts automatically. Accepts <strong>.csv</strong>, <strong>.xlsx</strong> and <strong>.xlsm</strong> directly — multi-sheet workbooks let you pick the sheet.</p>
+    <p>Works with any spreadsheet export — sales, market share, inventory, whatever you track over time. It looks for repeating columns like <span class="num">"MAT FEB'24" / "MAT FEB'25"</span> or <span class="num">"Sales Jan" / "Sales Feb"</span> and turns them into trend lines and forecasts automatically. Accepts <strong>.csv</strong>, <strong>.xlsx</strong> and <strong>.xlsm</strong> directly — sheets that share the same columns are combined automatically, and every sheet stays a click away.</p>
     <button class="pick" id="pickBtn">Choose file</button>
     <input type="file" id="fileInput" accept=".csv,.xlsx,.xlsm,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel.sheet.macroEnabled.12"/>
     <div class="hint">Everything runs in your browser — the file never leaves this tab.</div>
     <div id="parseStatus" class="small muted" style="margin-top:10px"></div>
     <div id="parseError"></div>
-  </div>
-
-  <div id="sheetPicker" class="card" hidden style="margin-top:18px;text-align:left;">
-    <h3 style="font-size:16px;margin-bottom:6px;">This workbook has more than one sheet</h3>
-    <p class="small muted" style="margin:0 0 14px;">Pick the one with your data — the largest sheet is pre-selected.</p>
-    <div id="sheetPickerList" class="table-scroll"></div>
-    <button class="btn" id="sheetPickerGo" style="margin-top:14px;">Use this sheet</button>
   </div>
 
   <nav class="tabs" id="tabs" hidden>
@@ -1022,7 +1015,8 @@
 
   /* ---------------- UI: file loading ---------------- */
   var dropzone=$('#dropzone'), fileInput=$('#fileInput'), pickBtn=$('#pickBtn'), parseError=$('#parseError');
-  var parseStatus=$('#parseStatus'), sheetPicker=$('#sheetPicker'), sheetPickerList=$('#sheetPickerList'), sheetPickerGo=$('#sheetPickerGo');
+  var parseStatus=$('#parseStatus'), sheetSwitcher=$('#sheetSwitcher');
+  var currentViews=[], currentFileName='';
   pickBtn.addEventListener('click',function(){ fileInput.click(); });
   fileInput.addEventListener('change',function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
   ['dragenter','dragover'].forEach(function(ev){
@@ -1036,44 +1030,71 @@
     if(f) loadFile(f);
   });
 
-  function finishLoad(rows,fileName){
-    if(rows.length<2) throw new Error('No data rows found.');
-    DS=buildDataset(rows);
-    DS.fileName=fileName;
-    onDatasetReady();
+  // Groups sheets that share identical headers into one combined view (with a
+  // "Sheet" source column added), and keeps every sheet individually
+  // selectable too — so nothing from a multi-sheet workbook is ever discarded.
+  function buildViews(sheets){
+    var groups={}; // header signature -> [sheet,...]
+    sheets.forEach(function(s){
+      var headerRow=(s.rows[0]||[]).map(function(h){return String(h).trim();});
+      var sig=JSON.stringify(headerRow);
+      (groups[sig]=groups[sig]||[]).push(s);
+    });
+    var views=sheets.map(function(s){ return {label:s.name,rows:s.rows}; });
+    var bestCombinedIndex=-1, bestCombinedRows=-1;
+    Object.keys(groups).forEach(function(sig){
+      var group=groups[sig];
+      if(group.length<2) return;
+      var headerRow=group[0].rows[0].map(function(h){return String(h).trim();});
+      var hasSheetCol=headerRow.some(function(h){return h.toLowerCase()==='sheet';});
+      var sourceCol=hasSheetCol?'Source Sheet':'Sheet';
+      var mergedRows=[headerRow.concat([sourceCol])];
+      group.forEach(function(s){
+        s.rows.slice(1).forEach(function(r){ mergedRows.push(r.concat([s.name])); });
+      });
+      var label='Combined — '+group.map(function(s){return s.name;}).join(' + ')+' ('+group.length+' sheets)';
+      views.push({label:label,rows:mergedRows,combined:true});
+      // Prefer the combined view with the most data as the default — a group
+      // covering every sheet is ideal, but any multi-sheet match (e.g. three
+      // matching data sheets plus one unrelated glossary sheet) still beats
+      // picking just one sheet and discarding the rest.
+      if(mergedRows.length>bestCombinedRows){ bestCombinedRows=mergedRows.length; bestCombinedIndex=views.length-1; }
+    });
+    var defaultIndex;
+    if(bestCombinedIndex>=0) defaultIndex=bestCombinedIndex;
+    else {
+      var bestI=0,bestScore=-1;
+      sheets.forEach(function(s,i){ var score=s.rowCount*s.colCount; if(score>bestScore){bestScore=score;bestI=i;} });
+      defaultIndex=bestI;
+    }
+    return {list:views,defaultIndex:defaultIndex};
   }
 
-  function showSheetPicker(sheets,fileName){
-    sheetPickerList.innerHTML='';
-    var sorted=sheets.map(function(s,i){return {s:s,i:i};}).sort(function(a,b){ return (b.s.rowCount*b.s.colCount)-(a.s.rowCount*a.s.colCount); });
-    var bestIdx=sorted.length?sorted[0].i:0;
-    sheets.forEach(function(s,i){
-      var row=el('label',{class:'sheet-row'});
-      var radio=el('input',{type:'radio',name:'sheetPick',value:i});
-      if(i===bestIdx) radio.checked=true;
-      row.appendChild(radio);
-      row.appendChild(el('span',{class:'sname'},[s.name]));
-      row.appendChild(el('span',{class:'sdims'},[fmtNum(s.rowCount,{maximumFractionDigits:0})+' rows × '+s.colCount+' cols']));
-      sheetPickerList.appendChild(row);
-    });
-    sheetPicker.hidden=false;
-    sheetPickerGo.onclick=function(){
-      var picked=$('input[name="sheetPick"]:checked',sheetPickerList);
-      var idx=picked?parseInt(picked.value,10):bestIdx;
-      sheetPicker.hidden=true;
-      try{
-        finishLoad(sheets[idx].rows,fileName+' — '+sheets[idx].name);
-      }catch(err){
-        parseError.textContent='Could not read this sheet: '+err.message;
-        dropzone.hidden=false;
-      }
-    };
+  function loadView(i){
+    var v=currentViews[i];
+    if(v.rows.length<2){ parseError.textContent='That sheet has no data rows.'; return; }
+    try{
+      DS=buildDataset(v.rows);
+      DS.fileName=currentFileName;
+      onDatasetReady();
+    }catch(err){
+      parseError.textContent='Could not read this sheet: '+err.message;
+    }
   }
+
+  function setViews(list,defaultIndex,fileName){
+    currentViews=list; currentFileName=fileName;
+    sheetSwitcher.innerHTML='';
+    list.forEach(function(v,i){ sheetSwitcher.appendChild(el('option',{value:i},[v.label])); });
+    sheetSwitcher.value=String(defaultIndex);
+    sheetSwitcher.hidden=list.length<=1;
+    loadView(defaultIndex);
+  }
+  sheetSwitcher.addEventListener('change',function(){ loadView(parseInt(sheetSwitcher.value,10)); });
 
   async function loadFile(file){
     parseError.textContent='';
     parseStatus.textContent='';
-    sheetPicker.hidden=true;
     var isCsv=/\.csv$/i.test(file.name);
     var isXlsx=/\.(xlsx|xlsm)$/i.test(file.name);
     if(!isCsv && !isXlsx){
@@ -1084,7 +1105,7 @@
       if(isCsv){
         var text=await file.text();
         var rows=parseCSV(text);
-        finishLoad(rows,file.name);
+        setViews([{label:file.name,rows:rows}],0,file.name);
       } else {
         parseStatus.textContent='Reading '+file.name+'…';
         var buf=await file.arrayBuffer();
@@ -1092,11 +1113,8 @@
         parseStatus.textContent='';
         var withData=sheets.filter(function(s){ return s.rowCount>0; });
         if(!withData.length) throw new Error('No sheets with data found in this workbook.');
-        if(withData.length===1){
-          finishLoad(withData[0].rows,file.name+' — '+withData[0].name);
-        } else {
-          showSheetPicker(withData,file.name);
-        }
+        var built=buildViews(withData);
+        setViews(built.list,built.defaultIndex,file.name);
       }
     }catch(err){
       parseStatus.textContent='';
@@ -1105,12 +1123,12 @@
   }
 
   $('#resetBtn').addEventListener('click',function(){
-    DS=null;
+    DS=null; currentViews=[]; currentFileName='';
     $('#dropzone').hidden=false;
-    $('#sheetPicker').hidden=true;
     $('#tabs').hidden=true;
     $('#panels').hidden=true;
     $('#fileStatus').hidden=true;
+    sheetSwitcher.hidden=true;
     fileInput.value='';
   });
 
