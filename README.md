@@ -2,7 +2,7 @@
 
 A self-contained, browser-only tool for spotting trends and building quick forecasts from any sales/market spreadsheet. Built and tested against a real pharma market-data export (MAT, sales, quantity and price by brand/company across periods), but works on any wide-format dataset with repeating time-based columns.
 
-**Live app:** _(GitHub Pages URL added after first deploy — see below)_
+**Live app:** https://coldop69.github.io/Cipla-Ai-agent/
 
 ## What it does
 
