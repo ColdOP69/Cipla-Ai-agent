@@ -240,6 +240,14 @@
   .hbar-track{background:var(--surface-2);border-radius:5px;height:14px;position:relative;overflow:hidden;}
   .hbar-fill{position:absolute;top:0;bottom:0;border-radius:5px;transition:width .6s cubic-bezier(.2,.8,.2,1);}
   .hbar-value{font-family:var(--font-mono);color:var(--text-muted);text-align:right;font-variant-numeric:tabular-nums;}
+
+  /* Sheet picker */
+  .sheet-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;}
+  .sheet-row:last-child{border-bottom:none;}
+  .sheet-row:hover{background:var(--surface-2);}
+  .sheet-row input{margin:0;flex:none;}
+  .sheet-row .sname{font-weight:600;flex:1;}
+  .sheet-row .sdims{font-size:12.5px;color:var(--text-muted);font-family:var(--font-mono);}
 </style>
 
 <div class="wrap">
@@ -261,12 +269,20 @@
   </header>
 
   <div id="dropzone">
-    <h2>Drop a CSV file here</h2>
-    <p>Works with any spreadsheet export — sales, market share, inventory, whatever you track over time. It looks for repeating columns like <span class="num">"MAT FEB'24" / "MAT FEB'25"</span> or <span class="num">"Sales Jan" / "Sales Feb"</span> and turns them into trend lines and forecasts automatically. Have an Excel file? Open it and use <strong>File → Save As → CSV</strong> first.</p>
-    <button class="pick" id="pickBtn">Choose CSV file</button>
-    <input type="file" id="fileInput" accept=".csv,text/csv"/>
+    <h2>Drop a CSV or Excel file here</h2>
+    <p>Works with any spreadsheet export — sales, market share, inventory, whatever you track over time. It looks for repeating columns like <span class="num">"MAT FEB'24" / "MAT FEB'25"</span> or <span class="num">"Sales Jan" / "Sales Feb"</span> and turns them into trend lines and forecasts automatically. Accepts <strong>.csv</strong>, <strong>.xlsx</strong> and <strong>.xlsm</strong> directly — multi-sheet workbooks let you pick the sheet.</p>
+    <button class="pick" id="pickBtn">Choose file</button>
+    <input type="file" id="fileInput" accept=".csv,.xlsx,.xlsm,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel.sheet.macroEnabled.12"/>
     <div class="hint">Everything runs in your browser — the file never leaves this tab.</div>
+    <div id="parseStatus" class="small muted" style="margin-top:10px"></div>
     <div id="parseError"></div>
+  </div>
+
+  <div id="sheetPicker" class="card" hidden style="margin-top:18px;text-align:left;">
+    <h3 style="font-size:16px;margin-bottom:6px;">This workbook has more than one sheet</h3>
+    <p class="small muted" style="margin:0 0 14px;">Pick the one with your data — the largest sheet is pre-selected.</p>
+    <div id="sheetPickerList" class="table-scroll"></div>
+    <button class="btn" id="sheetPickerGo" style="margin-top:14px;">Use this sheet</button>
   </div>
 
   <nav class="tabs" id="tabs" hidden>
@@ -348,6 +364,233 @@
     }
     if(field.length || row.length){ row.push(field); rows.push(row); }
     return rows.filter(function(r){ return !(r.length===1 && r[0]===''); });
+  }
+
+  /* ---------------- XLSX parsing (no external libraries) ----------------
+     Reads the .xlsx ZIP container using the browser's native
+     DecompressionStream, then parses the handful of XML parts a
+     spreadsheet actually needs (workbook, relationships, shared strings,
+     styles, worksheets). Falls back with a clear error on very old
+     browsers that lack DecompressionStream. */
+  function xlsxSupported(){ return typeof DecompressionStream!=='undefined'; }
+
+  async function inflateRaw(bytes){
+    var ds=new DecompressionStream('deflate-raw');
+    var writer=ds.writable.getWriter();
+    writer.write(bytes); writer.close();
+    var chunks=[], reader=ds.readable.getReader();
+    while(true){
+      var res=await reader.read();
+      if(res.done) break;
+      chunks.push(res.value);
+    }
+    var total=0; chunks.forEach(function(c){total+=c.length;});
+    var out=new Uint8Array(total), off=0;
+    chunks.forEach(function(c){ out.set(c,off); off+=c.length; });
+    return out;
+  }
+
+  function readZipCentralDirectory(buf){
+    var dv=new DataView(buf);
+    var n=buf.byteLength;
+    var eocd=-1;
+    var searchFrom=Math.max(0,n-65557);
+    for(var i=n-22;i>=searchFrom;i--){
+      if(dv.getUint32(i,true)===0x06054b50){ eocd=i; break; }
+    }
+    if(eocd<0) throw new Error('Not a valid .xlsx file (zip signature not found).');
+    var cdOffset=dv.getUint32(eocd+16,true);
+    var cdEntries=dv.getUint16(eocd+10,true);
+    var entries={};
+    var p=cdOffset;
+    var dec=new TextDecoder('utf-8');
+    for(var e=0;e<cdEntries;e++){
+      if(dv.getUint32(p,true)!==0x02014b50) break;
+      var method=dv.getUint16(p+10,true);
+      var compSize=dv.getUint32(p+20,true);
+      var uncompSize=dv.getUint32(p+24,true);
+      var nameLen=dv.getUint16(p+28,true);
+      var extraLen=dv.getUint16(p+30,true);
+      var commentLen=dv.getUint16(p+32,true);
+      var localOffset=dv.getUint32(p+42,true);
+      var nameBytes=new Uint8Array(buf,p+46,nameLen);
+      var name=dec.decode(nameBytes);
+      entries[name]={method:method,compSize:compSize,uncompSize:uncompSize,localOffset:localOffset};
+      p+=46+nameLen+extraLen+commentLen;
+    }
+    return entries;
+  }
+
+  async function getZipEntryBytes(buf,entries,name){
+    var meta=entries[name];
+    if(!meta) return null;
+    var dv=new DataView(buf);
+    var lp=meta.localOffset;
+    if(dv.getUint32(lp,true)!==0x04034b50) throw new Error('Corrupt zip entry: '+name);
+    var nameLen=dv.getUint16(lp+26,true);
+    var extraLen=dv.getUint16(lp+28,true);
+    var dataStart=lp+30+nameLen+extraLen;
+    var compressed=new Uint8Array(buf,dataStart,meta.compSize);
+    if(meta.method===0) return compressed.slice();
+    if(meta.method===8) return await inflateRaw(compressed);
+    throw new Error('Unsupported compression in .xlsx (method '+meta.method+').');
+  }
+
+  async function getZipEntryText(buf,entries,name){
+    var bytes=await getZipEntryBytes(buf,entries,name);
+    if(!bytes) return null;
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  function colLetterToIndex(ref){
+    var m=ref.match(/^([A-Z]+)/);
+    if(!m) return 0;
+    var s=m[1], idx=0;
+    for(var i=0;i<s.length;i++) idx=idx*26+(s.charCodeAt(i)-64);
+    return idx-1;
+  }
+
+  function xmlText(el){ return el ? (el.textContent||'') : ''; }
+
+  function parseSharedStrings(xml){
+    if(!xml) return [];
+    var doc=new DOMParser().parseFromString(xml,'application/xml');
+    var siNodes=doc.getElementsByTagName('si');
+    var out=[];
+    for(var i=0;i<siNodes.length;i++){
+      var si=siNodes[i];
+      var tNodes=si.getElementsByTagName('t');
+      if(tNodes.length){
+        var s=''; for(var j=0;j<tNodes.length;j++) s+=xmlText(tNodes[j]);
+        out.push(s);
+      } else out.push('');
+    }
+    return out;
+  }
+
+  // Built-in numFmtIds that represent dates/times (per ECMA-376). Custom
+  // formats (numFmtId >= 164) are checked by scanning their format code.
+  var BUILTIN_DATE_FMTS={14:1,15:1,16:1,17:1,18:1,19:1,20:1,21:1,22:1,27:1,28:1,29:1,30:1,31:1,32:1,33:1,34:1,35:1,36:1,45:1,46:1,47:1};
+  function parseDateStyleIndices(xml){
+    var dateStyles={};
+    if(!xml) return dateStyles;
+    var doc=new DOMParser().parseFromString(xml,'application/xml');
+    var customDateFmt={};
+    var numFmts=doc.getElementsByTagName('numFmt');
+    for(var i=0;i<numFmts.length;i++){
+      var id=parseInt(numFmts[i].getAttribute('numFmtId'),10);
+      var code=(numFmts[i].getAttribute('formatCode')||'');
+      if(/[ymdhs]/i.test(code) && !/general/i.test(code)) customDateFmt[id]=1;
+    }
+    var cellXfsParent=doc.getElementsByTagName('cellXfs')[0];
+    if(!cellXfsParent) return dateStyles;
+    var xfs=cellXfsParent.getElementsByTagName('xf');
+    for(var s=0;s<xfs.length;s++){
+      var fmtId=parseInt(xfs[s].getAttribute('numFmtId')||'0',10);
+      if(BUILTIN_DATE_FMTS[fmtId] || customDateFmt[fmtId]) dateStyles[s]=1;
+    }
+    return dateStyles;
+  }
+
+  function excelSerialToISODate(serial){
+    // Excel's epoch is 1899-12-30 (it wrongly treats 1900 as a leap year).
+    var ms=Math.round((serial-25569)*86400*1000);
+    var d=new Date(ms);
+    if(isNaN(d.getTime())) return String(serial);
+    var hasTime=Math.abs(serial%1)>1e-6;
+    var iso=d.toISOString();
+    return hasTime ? iso.slice(0,16).replace('T',' ') : iso.slice(0,10);
+  }
+
+  function parseWorkbookSheets(workbookXml,relsXml){
+    var doc=new DOMParser().parseFromString(workbookXml,'application/xml');
+    var relMap={};
+    if(relsXml){
+      var rdoc=new DOMParser().parseFromString(relsXml,'application/xml');
+      var rels=rdoc.getElementsByTagName('Relationship');
+      for(var i=0;i<rels.length;i++){
+        relMap[rels[i].getAttribute('Id')]=rels[i].getAttribute('Target');
+      }
+    }
+    var sheetNodes=doc.getElementsByTagName('sheet');
+    var out=[];
+    for(var s=0;s<sheetNodes.length;s++){
+      var name=sheetNodes[s].getAttribute('name');
+      var rId=sheetNodes[s].getAttribute('r:id') || sheetNodes[s].getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id');
+      var target=relMap[rId] || ('worksheets/sheet'+(s+1)+'.xml');
+      target=target.replace(/^\/?xl\//,'').replace(/^\.?\//,'');
+      out.push({name:name,path:'xl/'+target});
+    }
+    return out;
+  }
+
+  function parseSheetXml(xml,sharedStrings,dateStyles){
+    var doc=new DOMParser().parseFromString(xml,'application/xml');
+    var rowNodes=doc.getElementsByTagName('row');
+    var rows=[], maxCol=0;
+    for(var r=0;r<rowNodes.length;r++){
+      var cellNodes=rowNodes[r].getElementsByTagName('c');
+      var row=[], colCursor=0;
+      for(var c=0;c<cellNodes.length;c++){
+        var cell=cellNodes[c];
+        var ref=cell.getAttribute('r');
+        var idx=ref ? colLetterToIndex(ref) : colCursor;
+        var t=cell.getAttribute('t');
+        var sAttr=cell.getAttribute('s');
+        var vNode=cell.getElementsByTagName('v')[0];
+        var val='';
+        if(t==='s'){
+          var si=parseInt(xmlText(vNode)||'0',10);
+          val=sharedStrings[si]!==undefined ? sharedStrings[si] : '';
+        } else if(t==='inlineStr'){
+          var isNode=cell.getElementsByTagName('is')[0];
+          val=isNode ? xmlText(isNode) : '';
+        } else if(t==='str' || t==='e'){
+          val=xmlText(vNode);
+        } else if(t==='b'){
+          val=xmlText(vNode)==='1' ? 'TRUE' : 'FALSE';
+        } else {
+          var raw=xmlText(vNode);
+          if(raw!=='' && sAttr!==null && dateStyles[sAttr]){
+            var num=parseFloat(raw);
+            val=Number.isNaN(num) ? raw : excelSerialToISODate(num);
+          } else val=raw;
+        }
+        row[idx]=val;
+        colCursor=idx+1;
+        if(idx+1>maxCol) maxCol=idx+1;
+      }
+      rows.push(row);
+    }
+    // normalize ragged rows so every row has the same width
+    rows.forEach(function(row){
+      for(var i=0;i<maxCol;i++) if(row[i]===undefined) row[i]='';
+      row.length=maxCol;
+    });
+    return rows;
+  }
+
+  async function readXlsxWorkbook(arrayBuffer){
+    if(!xlsxSupported()) throw new Error('This browser can’t read Excel files directly (missing DecompressionStream). Please update your browser, or save the file as .csv instead.');
+    var entries=readZipCentralDirectory(arrayBuffer);
+    var workbookXml=await getZipEntryText(arrayBuffer,entries,'xl/workbook.xml');
+    if(!workbookXml) throw new Error('This doesn’t look like a valid .xlsx workbook.');
+    var relsXml=await getZipEntryText(arrayBuffer,entries,'xl/_rels/workbook.xml.rels');
+    var sharedStringsXml=await getZipEntryText(arrayBuffer,entries,'xl/sharedStrings.xml');
+    var stylesXml=await getZipEntryText(arrayBuffer,entries,'xl/styles.xml');
+    var sharedStrings=parseSharedStrings(sharedStringsXml);
+    var dateStyles=parseDateStyleIndices(stylesXml);
+    var sheetMeta=parseWorkbookSheets(workbookXml,relsXml);
+    var sheets=[];
+    for(var i=0;i<sheetMeta.length;i++){
+      var xml=await getZipEntryText(arrayBuffer,entries,sheetMeta[i].path);
+      if(xml===null) continue;
+      var rows=parseSheetXml(xml,sharedStrings,dateStyles);
+      var nonEmptyRows=rows.filter(function(row){ return row.some(function(v){return String(v).trim()!=='';}); });
+      sheets.push({name:sheetMeta[i].name,rows:rows,rowCount:nonEmptyRows.length,colCount:rows.reduce(function(m,r){return Math.max(m,r.length);},0)});
+    }
+    if(!sheets.length) throw new Error('No sheets found in this workbook.');
+    return sheets;
   }
 
   function parseNum(raw){
@@ -779,6 +1022,7 @@
 
   /* ---------------- UI: file loading ---------------- */
   var dropzone=$('#dropzone'), fileInput=$('#fileInput'), pickBtn=$('#pickBtn'), parseError=$('#parseError');
+  var parseStatus=$('#parseStatus'), sheetPicker=$('#sheetPicker'), sheetPickerList=$('#sheetPickerList'), sheetPickerGo=$('#sheetPickerGo');
   pickBtn.addEventListener('click',function(){ fileInput.click(); });
   fileInput.addEventListener('change',function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
   ['dragenter','dragover'].forEach(function(ev){
@@ -792,31 +1036,78 @@
     if(f) loadFile(f);
   });
 
-  function loadFile(file){
-    parseError.textContent='';
-    if(!/\.csv$/i.test(file.name)){
-      parseError.textContent='Please upload a .csv file. If this is an Excel file, open it and use File → Save As → CSV.';
-      return;
-    }
-    var reader=new FileReader();
-    reader.onload=function(){
+  function finishLoad(rows,fileName){
+    if(rows.length<2) throw new Error('No data rows found.');
+    DS=buildDataset(rows);
+    DS.fileName=fileName;
+    onDatasetReady();
+  }
+
+  function showSheetPicker(sheets,fileName){
+    sheetPickerList.innerHTML='';
+    var sorted=sheets.map(function(s,i){return {s:s,i:i};}).sort(function(a,b){ return (b.s.rowCount*b.s.colCount)-(a.s.rowCount*a.s.colCount); });
+    var bestIdx=sorted.length?sorted[0].i:0;
+    sheets.forEach(function(s,i){
+      var row=el('label',{class:'sheet-row'});
+      var radio=el('input',{type:'radio',name:'sheetPick',value:i});
+      if(i===bestIdx) radio.checked=true;
+      row.appendChild(radio);
+      row.appendChild(el('span',{class:'sname'},[s.name]));
+      row.appendChild(el('span',{class:'sdims'},[fmtNum(s.rowCount,{maximumFractionDigits:0})+' rows × '+s.colCount+' cols']));
+      sheetPickerList.appendChild(row);
+    });
+    sheetPicker.hidden=false;
+    sheetPickerGo.onclick=function(){
+      var picked=$('input[name="sheetPick"]:checked',sheetPickerList);
+      var idx=picked?parseInt(picked.value,10):bestIdx;
+      sheetPicker.hidden=true;
       try{
-        var rows=parseCSV(reader.result);
-        if(rows.length<2) throw new Error('No data rows found.');
-        DS=buildDataset(rows);
-        DS.fileName=file.name;
-        onDatasetReady();
+        finishLoad(sheets[idx].rows,fileName+' — '+sheets[idx].name);
       }catch(err){
-        parseError.textContent='Could not read this file: '+err.message;
+        parseError.textContent='Could not read this sheet: '+err.message;
+        dropzone.hidden=false;
       }
     };
-    reader.onerror=function(){ parseError.textContent='Could not read this file.'; };
-    reader.readAsText(file);
+  }
+
+  async function loadFile(file){
+    parseError.textContent='';
+    parseStatus.textContent='';
+    sheetPicker.hidden=true;
+    var isCsv=/\.csv$/i.test(file.name);
+    var isXlsx=/\.(xlsx|xlsm)$/i.test(file.name);
+    if(!isCsv && !isXlsx){
+      parseError.textContent='Unsupported file type. Please upload a .csv, .xlsx or .xlsm file.';
+      return;
+    }
+    try{
+      if(isCsv){
+        var text=await file.text();
+        var rows=parseCSV(text);
+        finishLoad(rows,file.name);
+      } else {
+        parseStatus.textContent='Reading '+file.name+'…';
+        var buf=await file.arrayBuffer();
+        var sheets=await readXlsxWorkbook(buf);
+        parseStatus.textContent='';
+        var withData=sheets.filter(function(s){ return s.rowCount>0; });
+        if(!withData.length) throw new Error('No sheets with data found in this workbook.');
+        if(withData.length===1){
+          finishLoad(withData[0].rows,file.name+' — '+withData[0].name);
+        } else {
+          showSheetPicker(withData,file.name);
+        }
+      }
+    }catch(err){
+      parseStatus.textContent='';
+      parseError.textContent='Could not read this file: '+err.message;
+    }
   }
 
   $('#resetBtn').addEventListener('click',function(){
     DS=null;
     $('#dropzone').hidden=false;
+    $('#sheetPicker').hidden=true;
     $('#tabs').hidden=true;
     $('#panels').hidden=true;
     $('#fileStatus').hidden=true;
