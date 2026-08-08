@@ -830,6 +830,8 @@
       btn.classList.add('active');
       $all('.panel').forEach(function(p){p.classList.remove('active');});
       $('#panel-'+btn.dataset.tab).classList.add('active');
+      // Report reflects whatever model has been trained since load, so refresh it every time it's opened.
+      if(btn.dataset.tab==='report' && DS) renderReport();
     });
   });
 
@@ -844,38 +846,48 @@
     return candidates[0].col;
   }
 
-  function buildKpiSection(groupNames){
+  function computeMetricSeries(g){
+    var periods=DS.timeGroups[g];
+    var totals=periods.map(function(p){
+      var cache=DS.numericCache[p.index],s=0;
+      DS.dataRows.forEach(function(r,i){ var v=cache[i]; if(!Number.isNaN(v)) s+=v; });
+      return s;
+    });
+    var first=totals[0], last=totals[totals.length-1];
+    var growth = first!==0 ? ((last-first)/Math.abs(first))*100 : null;
+    var lr=linreg1D(totals); var forecast=lr.slope*periods.length+lr.intercept;
+    return {periods:periods,totals:totals,first:first,last:last,growth:growth,forecast:forecast};
+  }
+
+  function buildKpiGrid(groupNames){
     if(!groupNames.length) return null;
     var kpiGrid=el('div',{class:'kpi-grid'});
     groupNames.forEach(function(g,gi){
-      var periods=DS.timeGroups[g];
-      var totals=periods.map(function(p){
-        var cache=DS.numericCache[p.index],s=0;
-        DS.dataRows.forEach(function(r,i){ var v=cache[i]; if(!Number.isNaN(v)) s+=v; });
-        return s;
-      });
-      var first=totals[0], last=totals[totals.length-1];
-      var growth = first!==0 ? ((last-first)/Math.abs(first))*100 : null;
-      var lr=linreg1D(totals); var forecast=lr.slope*periods.length+lr.intercept;
+      var m=computeMetricSeries(g);
       var color='var(--series-'+((gi%8)+1)+')';
-      var chip = growth===null ? el('span',{class:'chip flat'},['new']) :
-        el('span',{class:'chip '+(growth>0.5?'good':growth<-0.5?'bad':'flat')},[fmtPct(growth)]);
+      var chip = m.growth===null ? el('span',{class:'chip flat'},['new']) :
+        el('span',{class:'chip '+(m.growth>0.5?'good':m.growth<-0.5?'bad':'flat')},[fmtPct(m.growth)]);
       var card=el('div',{class:'kpi-card'});
       card.appendChild(el('div',{class:'kpi-top'},[el('span',{class:'kpi-name'},[g]),chip]));
-      card.appendChild(el('div',{class:'kpi-value'},[fmtNum(last)]));
+      card.appendChild(el('div',{class:'kpi-value'},[fmtNum(m.last)]));
       var sparkHost=el('div',{class:'kpi-spark'});
-      sparkHost.innerHTML=sparkline(totals,{width:240,height:46,forecast:forecast,color:color,
-        labels:periods.map(function(p){return p.label;})});
+      sparkHost.innerHTML=sparkline(m.totals,{width:240,height:46,forecast:m.forecast,color:color,
+        labels:m.periods.map(function(p){return p.label;})});
       card.appendChild(sparkHost);
       card.appendChild(el('div',{class:'kpi-foot'},[
-        el('span',null,[periods[0].label+' → '+periods[periods.length-1].label]),
-        el('span',{class:'fc'},['Next: '+fmtNum(forecast)])
+        el('span',null,[m.periods[0].label+' → '+m.periods[m.periods.length-1].label]),
+        el('span',{class:'fc'},['Next: '+fmtNum(m.forecast)])
       ]));
       kpiGrid.appendChild(card);
     });
-    var s=sectionBlock('Trend at a glance','Dataset-wide totals for each detected metric, with a linear-trend forecast for the next period.',[kpiGrid]);
     requestAnimationFrame(function(){ animatePaths(kpiGrid); });
-    return s;
+    return kpiGrid;
+  }
+
+  function buildKpiSection(groupNames){
+    var grid=buildKpiGrid(groupNames);
+    if(!grid) return null;
+    return sectionBlock('Trend at a glance','Dataset-wide totals for each detected metric, with a linear-trend forecast for the next period.',[grid]);
   }
 
   function buildCompositionSection(groupNames){
@@ -1169,9 +1181,10 @@
         var growth = (first!==0) ? ((last-first)/Math.abs(first))*100 : null;
         return {key:k,growth:growth,last:last};
       }).filter(function(x){ return x.growth!==null && isFinite(x.growth); });
-      var gainers=withGrowth.slice().sort(function(a,b){return b.growth-a.growth;}).slice(0,10);
-      var decliners=withGrowth.slice().sort(function(a,b){return a.growth-b.growth;}).slice(0,10);
+      var gainers=withGrowth.filter(function(x){return x.growth>0;}).sort(function(a,b){return b.growth-a.growth;}).slice(0,10);
+      var decliners=withGrowth.filter(function(x){return x.growth<0;}).sort(function(a,b){return a.growth-b.growth;}).slice(0,10);
       function moverTable(list,cls){
+        if(!list.length) return '<p class="small muted" style="padding:4px 2px">None — everything moved the other way.</p>';
         return '<table><tbody>'+list.map(function(x){
           return '<tr><td>'+escapeHtml(x.key)+'</td><td class="right"><span class="chip '+cls+'">'+fmtPct(x.growth)+'</span></td></tr>';
         }).join('')+'</tbody></table>';
@@ -1346,9 +1359,83 @@
   }
 
   /* ---------------- Report ---------------- */
+  function buildReportMovers(groupNames){
+    if(!groupNames.length || !DS.categoricalCols.length) return null;
+    var g=groupNames[0];
+    var periods=DS.timeGroups[g];
+    var catCol=pickDefaultCategorical();
+    if(!catCol) return null;
+    var firstCache=DS.numericCache[periods[0].index], lastCache=DS.numericCache[periods[periods.length-1].index];
+    var totals={};
+    DS.dataRows.forEach(function(r,i){
+      var key=(r[catCol.index]||'').trim() || '(blank)';
+      if(!totals[key]) totals[key]={first:0,last:0};
+      var fv=firstCache[i], lv=lastCache[i];
+      if(!Number.isNaN(fv)) totals[key].first+=fv;
+      if(!Number.isNaN(lv)) totals[key].last+=lv;
+    });
+    var entries=Object.keys(totals).map(function(k){
+      var t=totals[k]; var growth = t.first!==0 ? ((t.last-t.first)/Math.abs(t.first))*100 : null;
+      return {key:k,growth:growth};
+    }).filter(function(x){ return x.growth!==null && isFinite(x.growth); });
+    if(!entries.length) return null;
+    var gainers=entries.filter(function(x){return x.growth>0;}).sort(function(a,b){return b.growth-a.growth;}).slice(0,5);
+    var decliners=entries.filter(function(x){return x.growth<0;}).sort(function(a,b){return a.growth-b.growth;}).slice(0,5);
+    if(!gainers.length && !decliners.length) return null;
+
+    function miniList(list,cls){
+      var wrap=el('div');
+      if(!list.length){ wrap.appendChild(el('p',{class:'small muted'},['None — everything in this slice moved the other way.'])); return wrap; }
+      list.forEach(function(x){
+        wrap.appendChild(el('div',{class:'flex-between',style:'font-size:13px;padding:6px 0;border-bottom:1px solid var(--border)'},[
+          el('span',null,[x.key]),
+          el('span',{class:'chip '+cls},[fmtPct(x.growth)])
+        ]));
+      });
+      return wrap;
+    }
+    var body=el('div',{class:'grid cols-2'},[
+      (function(){ var c=el('div',{class:'card'}); c.appendChild(el('div',{class:'small',style:'margin-bottom:6px;font-weight:600;color:var(--good)'},['↑ Top gainers'])); c.appendChild(miniList(gainers,'good')); return c; })(),
+      (function(){ var c=el('div',{class:'card'}); c.appendChild(el('div',{class:'small',style:'margin-bottom:6px;font-weight:600;color:var(--bad)'},['↓ Top decliners'])); c.appendChild(miniList(decliners,'bad')); return c; })()
+    ]);
+    return sectionBlock('Biggest movers','By '+catCol.header+', '+g+' from '+periods[0].label+' to '+periods[periods.length-1].label+'.',[body]);
+  }
+
+  function buildReportModelCard(){
+    if(!lastModel) return null;
+    var stats=el('div',{class:'grid cols-3'},[
+      statTile('R²', lastModel.r2.toFixed(3), lastModel.r2>0.7?'strong fit':lastModel.r2>0.4?'moderate fit':'weak fit'),
+      statTile('RMSE', fmtNum(lastModel.rmse), 'typical prediction error'),
+      statTile('Rows used', fmtNum(lastModel.n,{maximumFractionDigits:0}), 'of '+fmtNum(DS.dataRows.length,{maximumFractionDigits:0}))
+    ]);
+    var importanceEntries=lastModelFeatures.map(function(fi,i){ return {label:colHeader(fi),value:lastModel.betaStd[i]}; })
+      .sort(function(a,b){ return Math.abs(b.value)-Math.abs(a.value); }).slice(0,6);
+    var body=el('div',{class:'card'});
+    body.appendChild(el('div',{class:'small muted',style:'margin-bottom:10px'},['Predicting '+colHeader(lastModelTarget)+' — top drivers']));
+    body.appendChild(hbarList(importanceEntries));
+    return sectionBlock('Predictive model',null,[stats,body]);
+  }
+
   function renderReport(){
     var panel=$('#panel-report'); panel.innerHTML='';
     var groupNames=Object.keys(DS.timeGroups);
+
+    panel.appendChild(el('div',{class:'small muted',style:'margin-bottom:18px'},[
+      'Generated '+new Date().toLocaleDateString('en-IN',{year:'numeric',month:'short',day:'numeric'})+' from '+(DS.fileName||'—')+' · '+fmtNum(DS.dataRows.length,{maximumFractionDigits:0})+' rows'
+    ]));
+
+    var kpiGrid=buildKpiGrid(groupNames);
+    if(kpiGrid) panel.appendChild(sectionBlock('At a glance',null,[kpiGrid]));
+    else panel.appendChild(sectionBlock('At a glance','No time-based trend metrics were detected in this file.',[]));
+
+    var moversSection=buildReportMovers(groupNames);
+    if(moversSection) panel.appendChild(moversSection);
+
+    var modelSection=buildReportModelCard();
+    if(modelSection) panel.appendChild(modelSection);
+    else panel.appendChild(el('p',{class:'small muted',style:'margin:-8px 0 24px'},['Tip: train a model in the Predict tab to include it here.']));
+
+    // plain-text version, used for copy + download only
     var summaryLines=[];
     summaryLines.push('TREND & PREDICT — SUMMARY REPORT');
     summaryLines.push('File: '+(DS.fileName||'—'));
@@ -1357,30 +1444,18 @@
     summaryLines.push('Rows: '+DS.dataRows.length+'  |  Columns: '+DS.headers.length+
       ' ('+DS.numericCols.length+' numeric, '+DS.categoricalCols.length+' categorical)');
     summaryLines.push('');
-
-    var cards=[];
     if(groupNames.length){
       groupNames.forEach(function(g){
-        var periods=DS.timeGroups[g];
-        var totals=periods.map(function(p){
-          var cache=DS.numericCache[p.index],s=0;
-          DS.dataRows.forEach(function(r,i){ var v=cache[i]; if(!Number.isNaN(v)) s+=v; });
-          return s;
-        });
-        var first=totals[0], last=totals[totals.length-1];
-        var growth=first!==0?((last-first)/Math.abs(first))*100:null;
-        var lr=linreg1D(totals); var forecast=lr.slope*periods.length+lr.intercept;
+        var m=computeMetricSeries(g);
         summaryLines.push('METRIC: '+g);
-        summaryLines.push('  '+periods.map(function(p,i){return p.label+'='+fmtNum(totals[i]);}).join('  |  '));
-        summaryLines.push('  Growth ('+periods[0].label+' → '+periods[periods.length-1].label+'): '+(growth===null?'n/a':fmtPct(growth)));
-        summaryLines.push('  Forecast next period: '+fmtNum(forecast));
+        summaryLines.push('  '+m.periods.map(function(p,i){return p.label+'='+fmtNum(m.totals[i]);}).join('  |  '));
+        summaryLines.push('  Growth ('+m.periods[0].label+' → '+m.periods[m.periods.length-1].label+'): '+(m.growth===null?'n/a':fmtPct(m.growth)));
+        summaryLines.push('  Forecast next period: '+fmtNum(m.forecast));
         summaryLines.push('');
-        cards.push(statTile(g+' — latest total', fmtNum(last), (growth===null?'':fmtPct(growth)+' since '+periods[0].label)));
       });
     } else {
       summaryLines.push('No time-based trend metrics were detected in this file.');
     }
-
     if(lastModel){
       summaryLines.push('PREDICTIVE MODEL');
       summaryLines.push('  Target: '+colHeader(lastModelTarget));
@@ -1389,19 +1464,27 @@
       summaryLines.push('');
     }
 
-    if(cards.length) panel.appendChild(sectionBlock('At a glance',null,[el('div',{class:'grid cols-3'},cards)]));
-
-    var pre=el('div',{class:'card'});
-    pre.appendChild(el('div',{class:'eq-card',style:'white-space:pre-wrap;font-family:var(--font-mono)'},[summaryLines.join('\n')]));
-    panel.appendChild(sectionBlock('Full text summary','Everything below is included in the downloadable report.',[pre]));
-
-    var dlBtn=el('button',{class:'btn'},['Download report (.txt)']);
+    var actionsRow=el('div',{class:'flex-between',style:'margin:8px 0 12px'},[
+      el('h3',{style:'font-size:15px'},['Full text report']),
+      el('div',{style:'display:flex;gap:8px'})
+    ]);
+    var btnRow=actionsRow.lastChild;
+    var copyBtn=el('button',{class:'btn secondary'},['Copy']);
+    copyBtn.addEventListener('click',function(){
+      var text=summaryLines.join('\n');
+      var done=function(){ var orig=copyBtn.textContent; copyBtn.textContent='Copied ✓'; setTimeout(function(){copyBtn.textContent=orig;},1500); };
+      if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, done);
+      else done();
+    });
+    var dlBtn=el('button',{class:'btn'},['Download .txt']);
     dlBtn.addEventListener('click',function(){ downloadText('trend-report.txt',summaryLines.join('\n')); });
-    panel.appendChild(el('div',{style:'margin-top:4px'},[dlBtn]));
+    btnRow.appendChild(copyBtn); btnRow.appendChild(dlBtn);
+    panel.appendChild(actionsRow);
 
-    if(!lastModel){
-      panel.appendChild(el('p',{class:'small muted',style:'margin-top:14px'},['Tip: train a model in the Predict tab first to include it in this report.']));
-    }
+    var details=el('details');
+    details.appendChild(el('summary',{style:'cursor:pointer;color:var(--accent-strong);font-size:13.5px;font-weight:600'},['View plain-text report']));
+    details.appendChild(el('div',{class:'eq-card',style:'white-space:pre-wrap;font-family:var(--font-mono);margin-top:10px'},[summaryLines.join('\n')]));
+    panel.appendChild(details);
   }
 
   /* ---------------- boot ---------------- */
